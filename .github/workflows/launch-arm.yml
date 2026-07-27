@@ -1,0 +1,94 @@
+name: Launch OCI ARM A1 (4/24)
+
+# 한 번 실행되면 내부에서 60초마다 계속 재시도(약 5시간 50분).
+# 6시간마다 새 실행이 이어받아 사실상 "분당" 폴링을 유지합니다.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+concurrency:
+  group: oci-arm-launcher
+  cancel-in-progress: false
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Install OCI CLI
+        run: |
+          curl -sL https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh \
+            | bash -s -- --accept-all-defaults >/dev/null 2>&1
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Write OCI config
+        run: |
+          mkdir -p ~/.oci
+          cat > ~/.oci/key.pem <<'PEMEOF'
+          ${{ secrets.OCI_PRIVATE_KEY }}
+          PEMEOF
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=ocid1.user.oc1..aaaaaaaagxoky45dc7daq7aaaggztdn4bsulmje5ezrno3azj64tgu7jq5mq
+          fingerprint=d5:40:4b:b4:83:a4:89:d7:2c:1c:cf:59:ab:73:0c:a9
+          tenancy=ocid1.tenancy.oc1..aaaaaaaada7oksn7jjgeasvt7eqje6scyoregvgb6f66vvgrerqunfykxzda
+          region=ap-chuncheon-1
+          key_file=$HOME/.oci/key.pem
+          EOF
+          chmod 600 ~/.oci/config
+
+      - name: Poll and launch (every 60s)
+        env:
+          SUPPRESS_LABEL_WARNING: "True"
+        run: |
+          set +e
+          COMP=ocid1.tenancy.oc1..aaaaaaaada7oksn7jjgeasvt7eqje6scyoregvgb6f66vvgrerqunfykxzda
+          AD="NJWD:AP-CHUNCHEON-1-AD-1"
+          IMG=ocid1.image.oc1.ap-chuncheon-1.aaaaaaaa7vhzxcs4hw7sja74hfacg5osp5vxhiqjobfvu7t2hqhxbqlfconq
+          SUB=ocid1.subnet.oc1.ap-chuncheon-1.aaaaaaaabwdz5fmixq5tkmdyi2lpewja6vrkcklnzltps3oa2m64lv3ot6wq
+          SSHKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP5HnT7VcvWujJODKwEU5kNXmMW/28ooymXBYT0nkl2F oci-arm"
+          INTERVAL=60          # 재시도 간격(초)
+          DEADLINE=$((SECONDS + 20400))   # 약 340분 동안 폴링
+
+          try_launch() {
+            # 이미 A1 인스턴스가 있으면 종료(중복 방지)
+            RUNNING=$(oci compute instance list -c "$COMP" \
+              --query "length(data[?shape=='VM.Standard.A1.Flex' && \"lifecycle-state\"!='TERMINATED'])" 2>/dev/null)
+            if [ -n "$RUNNING" ] && [ "$RUNNING" != "0" ]; then
+              echo "✅ A1 instance already exists (count=$RUNNING). Done."
+              return 0
+            fi
+            OUT=$(oci compute instance launch \
+              --availability-domain "$AD" \
+              --compartment-id "$COMP" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+              --image-id "$IMG" \
+              --subnet-id "$SUB" \
+              --assign-public-ip true \
+              --display-name "arm-free-4-24" \
+              --metadata "{\"ssh_authorized_keys\":\"$SSHKEY\"}" 2>&1)
+            if [ $? -eq 0 ]; then
+              echo "✅ SUCCESS: instance launched!"
+              echo "$OUT" | grep -i '"id"' | head -1
+              return 0
+            fi
+            # 실패 사유 요약(용량/한도/업그레이드 대기 등)
+            REASON=$(echo "$OUT" | grep -i '"code"' | head -1)
+            echo "$(date -u +%H:%M:%S) ⏳ not yet ${REASON}"
+            return 1
+          }
+
+          n=0
+          while [ $SECONDS -lt $DEADLINE ]; do
+            n=$((n+1))
+            if try_launch; then
+              echo "Finished after $n attempts."
+              exit 0
+            fi
+            sleep $INTERVAL
+          done
+          echo "Poller window ended after $n attempts; next scheduled run continues."
+          exit 0
